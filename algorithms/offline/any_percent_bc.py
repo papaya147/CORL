@@ -12,8 +12,8 @@ import pyrallis
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import wandb
+from minari.data_collector import EpisodeBuffer
 
 TensorBatch = List[torch.Tensor]
 
@@ -81,6 +81,7 @@ def wrap_env(
     state_mean: Union[np.ndarray, float] = 0.0,
     state_std: Union[np.ndarray, float] = 1.0,
     reward_scale: float = 1.0,
+    max_episode_steps: int = 1000,
 ) -> gym.Env:
     # PEP 8: E731 do not assign a lambda expression, use a def
     def normalize_state(state):
@@ -95,6 +96,7 @@ def wrap_env(
     env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward, env.observation_space)
+    env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
     return env
 
 
@@ -193,11 +195,11 @@ def eval_actor(
     episode_rewards = []
     for _ in range(n_episodes):
         state, _ = env.reset()
-        done = False
+        terminated, truncated = False, False
         episode_reward = 0.0
-        while not done:
+        while not terminated and not truncated:
             action = actor.act(state, device)
-            state, reward, done, _, _ = env.step(action)
+            state, reward, terminated, truncated, _ = env.step(action)
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
@@ -206,39 +208,48 @@ def eval_actor(
 
 
 def keep_best_trajectories(
-    dataset: Dict[str, np.ndarray],
+    dataset: minari.MinariDataset,
     frac: float,
     discount: float,
     max_episode_steps: int = 1000,
-):
-    ids_by_trajectories = []
-    returns = []
-    cur_ids = []
-    cur_return = 0
-    reward_scale = 1.0
-    for i, (reward, done) in enumerate(zip(dataset["rewards"], dataset["terminals"])):
-        cur_return += reward_scale * reward
-        cur_ids.append(i)
-        reward_scale *= discount
-        if done == 1.0 or len(cur_ids) == max_episode_steps:
-            ids_by_trajectories.append(list(cur_ids))
-            returns.append(cur_return)
-            cur_ids = []
-            cur_return = 0
-            reward_scale = 1.0
+) -> minari.MinariDataset:
+    episode_returns = []
 
-    sort_ord = np.argsort(returns, axis=0)[::-1].reshape(-1)
-    top_trajs = sort_ord[: max(1, int(frac * len(sort_ord)))]
+    for ep in dataset.iterate_episodes():
+        rew = ep.rewards[:max_episode_steps]
 
-    order = []
-    for i in top_trajs:
-        order += ids_by_trajectories[i]
-    order = np.array(order)
-    dataset["observations"] = dataset["observations"][order]
-    dataset["actions"] = dataset["actions"][order]
-    dataset["next_observations"] = dataset["next_observations"][order]
-    dataset["rewards"] = dataset["rewards"][order]
-    dataset["terminals"] = dataset["terminals"][order]
+        discounts = np.power(discount, np.arange(len(rew)))
+        discounted_return = float(np.sum(rew * discounts))
+        episode_returns.append(discounted_return)
+
+    n_keep = max(1, int(frac * len(episode_returns)))
+    top_indices = np.argsort(episode_returns)[-n_keep:]
+
+    best_episodes = []
+    for i, idx in enumerate(top_indices):
+        ep = dataset[idx]
+        best_episodes.append(
+            EpisodeBuffer(
+                i,
+                seed=None,
+                observations=ep.observations,
+                actions=ep.actions,
+                rewards=ep.rewards,
+                terminations=ep.terminations,
+                truncations=ep.truncations,
+                infos=ep.infos,
+            )
+        )
+
+    env = dataset.recover_environment()
+
+    return minari.create_dataset_from_buffers(
+        dataset_id=f"mujoco/halfcheetah/medium-best-{n_keep}-eps-v0",
+        buffer=best_episodes,
+        env=env,
+        ref_min_score=1214.0,
+        ref_max_score=8663.0,
+    )
 
 
 class Actor(nn.Module):
@@ -339,15 +350,15 @@ def dict_from_minari_dataset(
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    dataset = minari.load_dataset(config.env, download=True)
-    env = dataset.recover_environment()
+    minari_dataset = minari.load_dataset(config.env, download=True)
+    env = minari_dataset.recover_environment()
 
-    state_dim = dataset.observation_space.shape[0]
-    action_dim = dataset.action_space.shape[0]
+    state_dim = minari_dataset.observation_space.shape[0]
+    action_dim = minari_dataset.action_space.shape[0]
 
-    dataset = dict_from_minari_dataset(dataset)
+    minari_dataset = keep_best_trajectories(minari_dataset, config.frac, config.discount)
 
-    keep_best_trajectories(dataset, config.frac, config.discount)
+    dataset = dict_from_minari_dataset(minari_dataset)
 
     if config.normalize:
         state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
@@ -423,7 +434,9 @@ def train(config: TrainConfig):
                 seed=config.seed,
             )
             eval_score = eval_scores.mean()
-            normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
+            normalized_eval_score = (
+                minari.get_normalized_score(minari_dataset, eval_score) * 100.0
+            )
             evaluations.append(normalized_eval_score)
             print("---------------------------------------")
             print(
