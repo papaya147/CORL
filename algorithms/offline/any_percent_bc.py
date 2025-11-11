@@ -5,13 +5,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import d4rl
-import gym
+import gymnasium as gym
+import minari
 import numpy as np
 import pyrallis
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 import wandb
 
 TensorBatch = List[torch.Tensor]
@@ -26,7 +27,7 @@ class TrainConfig:
     # wandb run name
     name: str = "BC"
     # training dataset and evaluation environment
-    env: str = "halfcheetah-medium-expert-v2"
+    env: str = "mujoco/halfcheetah/medium-v0"
     # total gradient updates during training
     max_timesteps: int = int(1e6)
     # training batch size
@@ -52,7 +53,7 @@ class TrainConfig:
     # training random seed
     seed: int = 0
     # training device
-    device: str = "cuda"
+    device: str = "mps"
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -91,9 +92,9 @@ def wrap_env(
         # Please be careful, here reward is multiplied by scale!
         return reward_scale * reward
 
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     if reward_scale != 1.0:
-        env = gym.wrappers.TransformReward(env, scale_reward)
+        env = gym.wrappers.TransformReward(env, scale_reward, env.observation_space)
     return env
 
 
@@ -163,7 +164,7 @@ def set_seed(
     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
 ):
     if env is not None:
-        env.seed(seed)
+        env.reset(seed=seed)
         env.action_space.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
@@ -180,22 +181,23 @@ def wandb_init(config: dict) -> None:
         name=config["name"],
         id=str(uuid.uuid4()),
     )
-    wandb.run.save()
+    wandb.run.save("checkpoints/*.pt")
 
 
 @torch.no_grad()
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    env.seed(seed)
+    env.reset(seed=seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        state, _ = env.reset()
+        done = False
         episode_reward = 0.0
         while not done:
             action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
+            state, reward, done, _, _ = env.step(action)
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
@@ -310,14 +312,40 @@ class BC:
         self.total_it = state_dict["total_it"]
 
 
+def dict_from_minari_dataset(
+    dataset: minari.MinariDataset, max_episode_steps: int = 1000
+) -> Dict[str, np.ndarray]:
+    observations = []
+    actions = []
+    rewards = []
+    next_observations = []
+    terminations = []
+
+    for ep in dataset.iterate_episodes():
+        observations.extend(ep.observations[:max_episode_steps])
+        actions.extend(ep.actions[:max_episode_steps])
+        rewards.extend(ep.rewards[:max_episode_steps])
+        next_observations.extend(ep.observations[1 : max_episode_steps + 1])
+        terminations.extend(ep.terminations[:max_episode_steps])
+
+    return {
+        "observations": np.array(observations),
+        "actions": np.array(actions),
+        "rewards": np.array(rewards),
+        "next_observations": np.array(next_observations),
+        "terminals": np.array(terminations),
+    }
+
+
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = gym.make(config.env)
+    dataset = minari.load_dataset(config.env, download=True)
+    env = dataset.recover_environment()
 
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    state_dim = dataset.observation_space.shape[0]
+    action_dim = dataset.action_space.shape[0]
 
-    dataset = d4rl.qlearning_dataset(env)
+    dataset = dict_from_minari_dataset(dataset)
 
     keep_best_trajectories(dataset, config.frac, config.discount)
 
